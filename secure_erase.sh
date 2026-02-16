@@ -540,8 +540,9 @@ select_device() {
   ui ""
   local choice
   while true; do
-    read -r -p "Select device (number, or 'q' to quit): " choice >&2
+    read -r -p "Select device (number, 'd' rescan, 'q' quit): " choice >&2
     [[ "$choice" == "q" || "$choice" == "Q" ]] && return 1
+    [[ "$choice" == "d" || "$choice" == "D" ]] && { printf "%s\n" "RESCAN"; return 0; }
     [[ "$choice" =~ ^[0-9]+$ ]] || { ui "Please enter a number."; continue; }
     (( choice >= 1 && choice <= ${#DEV_NAMES[@]} )) || { ui "Out of range."; continue; }
 
@@ -701,8 +702,12 @@ run_or_print() {
     [[ -z "$line" ]] && continue
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
     ui "${DIM}>>${RST} $line"
-    bash -c "$line"
-  done <<<"$cmd_block"
+    if ! bash -c "$line"; then
+      ui ""
+      ui "${RED}Command failed (exit code $?). Aborting.${RST}"
+      return 2
+    fi
+  done < <(printf '%b\n' "$cmd_block")
 
   ui ""
   ui "${GRN}Done.${RST}"
@@ -724,6 +729,14 @@ main() {
   while true; do
     local selection dev category
     selection="$(select_device)" || exit 0
+
+    if [[ "$selection" == "RESCAN" ]]; then
+      ui ""
+      ui "${CYA}Rescanning devices...${RST}"
+      detect_system_devices
+      continue
+    fi
+
     dev="${selection%%|*}"
     category="${selection##*|}"
 
