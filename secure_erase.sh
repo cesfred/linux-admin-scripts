@@ -7,6 +7,7 @@
 #  - Shows structured security ratings per method
 #  - Protects against accidentally erasing the system disk
 #  - Optionally verifies erasure afterwards
+#  - Writes an audit log of executed operations to ~/secure_erase_audit.log
 #
 # Usage:
 #   bash secure_erase.sh
@@ -14,6 +15,11 @@
 # Optional deps: nvme-cli, hdparm, util-linux (blkdiscard), cryptsetup
 
 set -Eeuo pipefail
+
+# Force English tool output: error detection greps for English messages
+# (e.g. dd's "No space left on device"). Debian/Ubuntu sudo keeps LC_* via
+# env_keep, so this propagates into the sudo'ed commands as well.
+export LC_ALL=C LANG=C
 
 # ---------- UI printing goes to STDERR so command substitutions don't swallow it ----------
 ui()       { printf "%s\n" "$*" >&2; }
@@ -29,6 +35,14 @@ fi
 die()     { ui "${RED}Error:${RST} $*"; exit 1; }
 need()    { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------- Audit log ----------
+# Records every executed erase/wipe (device, model, serial, method, result)
+# so there is evidence of what was done to which drive and when.
+AUDIT_LOG="${HOME}/secure_erase_audit.log"
+audit_log() {
+  printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$AUDIT_LOG" 2>/dev/null || true
+}
 
 # Recursively send a signal to a PID and all its descendants.
 # Needed because `bash -c "sudo cmd"` puts cmd two levels deep; killing the
@@ -106,18 +120,19 @@ supports_discard() {
 
 is_nvme() { [[ "$1" == nvme* ]]; }
 
-# Walk up the block-device tree to the top-level disk.
-# Needed because lsblk only reports TRAN on the disk row, so partitions and
-# nested devices (e.g. bitlk-* on sdc2 on sdc) must look up the parent disk
-# to be categorized correctly (USB vs HDD/SSD).
+# Walk up the block-device tree to the top-level disk and print its kernel
+# name (e.g. "sdc"). Takes a device PATH (/dev/sdc1, /dev/mapper/bitlk-...),
+# not a name — dm/crypt devices are only reachable via /dev/mapper/, and
+# lsblk reports TRAN only on the disk row, so nested devices must resolve
+# their parent disk to be categorized correctly (USB vs HDD/SSD).
 top_level_disk() {
   local cur="$1" parent
   while true; do
-    parent="$(lsblk -no PKNAME "/dev/$cur" 2>/dev/null | awk 'NF{print; exit}')"
-    [[ -z "$parent" || "$parent" == "$cur" ]] && break
-    cur="$parent"
+    parent="$(lsblk -no PKNAME "$cur" 2>/dev/null | awk 'NF{print; exit}')"
+    [[ -z "$parent" || "/dev/$parent" == "$cur" ]] && break
+    cur="/dev/$parent"
   done
-  printf '%s\n' "$cur"
+  printf '%s\n' "${cur##*/}"
 }
 
 device_has_mounts() {
@@ -172,24 +187,17 @@ categorize_device() {
 }
 
 # ---------- System disk detection ----------
-# Returns the base block device name (e.g. "sda") for a mountpoint
+# Returns the top-level disk name (e.g. "sda") for a mountpoint.
+# Walks the full dm/LVM/LUKS stack: /dev/mapper/luks-root -> nvme0n1p2 ->
+# nvme0n1 — a single-PKNAME lookup would stop at the partition and the
+# system disk would never be flagged [SYSTEM] on encrypted-root systems.
 get_base_device_for_mount() {
   local mp="$1"
   local src
-  src="$(findmnt -n -o SOURCE "$mp" 2>/dev/null)" || return 1
-  [[ -z "$src" ]] && return 1
-
-  # Strip /dev/ prefix
-  src="${src#/dev/}"
-
-  # Resolve to parent disk (e.g. sda1 -> sda, nvme0n1p2 -> nvme0n1)
-  local parent
-  parent="$(lsblk -no PKNAME "$(devpath "$src")" 2>/dev/null | head -1)" || true
-  if [[ -n "$parent" ]]; then
-    echo "$parent"
-  else
-    echo "$src"
-  fi
+  src="$(findmnt -n -o SOURCE "$mp" 2>/dev/null | head -n1)" || return 1
+  src="${src%%\[*}"                 # btrfs subvolume suffix: /dev/sda2[/@root]
+  [[ "$src" == /dev/* ]] || return 1  # skip overlay, tmpfs, autofs, ...
+  top_level_disk "$src"
 }
 
 SYSTEM_DEVICES=()
@@ -217,9 +225,20 @@ bus_rescan() {
   fi
 }
 
+add_system_device() {
+  local dev="$1" d
+  [[ -n "$dev" ]] || return 0
+  if (( ${#SYSTEM_DEVICES[@]} > 0 )); then
+    for d in "${SYSTEM_DEVICES[@]}"; do
+      [[ "$d" == "$dev" ]] && return 0
+    done
+  fi
+  SYSTEM_DEVICES+=("$dev")
+}
+
 detect_system_devices() {
   SYSTEM_DEVICES=()
-  local mp dev d found
+  local mp dev sw _rest
 
   # Scan all mounts and collect parent disks for any mountpoint that matches
   # the same critical-path regex used by is_system_partition. Keeps disk-level
@@ -229,16 +248,17 @@ detect_system_devices() {
     [[ -z "$mp" ]] && continue
     [[ "$mp" =~ ^(/|/boot|/usr|/var|/etc|/lib|/lib64|/bin|/sbin)(/|$) ]] || continue
     dev="$(get_base_device_for_mount "$mp" 2>/dev/null)" || true
-    [[ -z "$dev" ]] && continue
-
-    found=false
-    if (( ${#SYSTEM_DEVICES[@]} > 0 )); then
-      for d in "${SYSTEM_DEVICES[@]}"; do
-        [[ "$d" == "$dev" ]] && found=true
-      done
-    fi
-    [[ "$found" == "false" ]] && SYSTEM_DEVICES+=("$dev")
+    add_system_device "${dev:-}"
   done < <(findmnt -rn -o TARGET 2>/dev/null)
+
+  # Active swap devices count as system devices too.
+  if [[ -r /proc/swaps ]]; then
+    while IFS=' 	' read -r sw _rest; do
+      [[ "$sw" == /dev/* ]] || continue
+      dev="$(top_level_disk "$sw")" || true
+      add_system_device "${dev:-}"
+    done < <(tail -n +2 /proc/swaps 2>/dev/null)
+  fi
 }
 
 is_system_device() {
@@ -261,7 +281,7 @@ is_system_partition() {
 # ---------- List all block devices ----------
 # Stores device info in parallel arrays for structured access
 declare -a DEV_NAMES DEV_SIZES DEV_CATEGORIES DEV_TRANS DEV_MODELS DEV_SERIALS
-declare -a PART_NAMES PART_SIZES PART_FSTYPES PART_MOUNTS PART_PARENTS PART_TYPES
+declare -a PART_NAMES PART_SIZES PART_FSTYPES PART_MOUNTS PART_TOPS PART_TYPES PART_PATHS
 declare -a SCRIPT_LUKS_MAPPERS SCRIPT_MOUNTPOINTS
 SCRIPT_LUKS_MAPPERS=()
 SCRIPT_MOUNTPOINTS=()
@@ -313,21 +333,44 @@ build_methods_for_device() {
 
   case "$category" in
     NVMe)
-      # NVMe: controller-native format is best
+      # NVMe: controller-native erase is best. Three variants:
+      #   --ses=1  User Data Erase: controller erases all user data cells
+      #            incl. spare area; universally supported.
+      #   --ses=2  Crypto Erase: destroys the internal encryption key —
+      #            instant, but only on self-encrypting drives.
+      #   sanitize Strongest: erases user data, caches and over-provisioning
+      #            across ALL namespaces; survives reset, runs to completion.
+      # Plain 'nvme format' without --ses does NOT request a secure erase!
       if has_cmd nvme; then
         add_method \
-          "nvme_format" \
-          "NVMe Format (controller-native)" \
+          "nvme_format_ses1" \
+          "NVMe Format + User Data Erase (--ses=1)" \
           "yes" \
-          "sudo nvme format -f $(devpath "$dev")" \
-          "Controller wipes all flash cells including spare area." \
+          "sudo nvme format --ses=1 --force $(devpath "$dev")" \
+          "Controller erases all user data flash cells incl. spare area. Works on every NVMe drive." \
           "★★★|practically impossible|Controller-internal command, covers entire flash incl. over-provisioning"
+
+        add_method \
+          "nvme_format_ses2" \
+          "NVMe Format + Crypto Erase (--ses=2, instant)" \
+          "no" \
+          "sudo nvme format --ses=2 --force $(devpath "$dev")" \
+          "Destroys the drive-internal encryption key: done in seconds. Only works on self-encrypting drives (command is rejected otherwise — then use --ses=1)." \
+          "★★★|practically impossible|Key destruction: encrypted data unrecoverable without key"
+
+        add_method \
+          "nvme_sanitize" \
+          "NVMe Sanitize (block erase, whole device)" \
+          "no" \
+          "sudo nvme sanitize --sanact=2 $(devpath "$dev")\nsudo nvme sanitize-log $(devpath "$dev")" \
+          "Strongest NVMe erase: all namespaces, caches and over-provisioning. Starts in background — check progress via sanitize-log (SPROG=65535 means finished). Not supported by every drive." \
+          "★★★|practically impossible|NVMe Sanitize erases user data, caches and spare area device-wide"
       else
         add_method \
-          "nvme_format" \
-          "NVMe Format (nvme-cli not installed)" \
+          "nvme_format_ses1" \
+          "NVMe Format + User Data Erase (nvme-cli not installed)" \
           "yes" \
-          "# sudo apt install nvme-cli\nsudo nvme format -f $(devpath "$dev")" \
+          "# sudo apt install nvme-cli\nsudo nvme format --ses=1 --force $(devpath "$dev")" \
           "Recommended for NVMe, but nvme-cli is missing." \
           "★★★|practically impossible|Controller-internal command, covers entire flash incl. over-provisioning"
       fi
@@ -598,12 +641,22 @@ verify_erase() {
   local total_blocks=$((dev_size_bytes / block_size))
   local all_zero=true
 
-  # Check first block, last block, and 3 random positions
-  local positions=("0")
+  # Check first block, last block, and 3 random positions.
+  # $RANDOM alone is only 15 bits (max 32767) — on a large disk that would
+  # sample just the first 128 MB, so use shuf over the full block range.
+  local positions=("0") pos
   ((total_blocks > 1)) && positions+=("$((total_blocks - 1))")
-  for _ in 1 2 3; do
-    ((total_blocks > 2)) && positions+=("$((RANDOM % total_blocks))")
-  done
+  if ((total_blocks > 2)); then
+    if has_cmd shuf; then
+      while IFS= read -r pos; do
+        positions+=("$pos")
+      done < <(shuf -i 0-$((total_blocks - 1)) -n 3)
+    else
+      for _ in 1 2 3; do
+        positions+=("$(( ( (RANDOM << 30) | (RANDOM << 15) | RANDOM ) % total_blocks ))")
+      done
+    fi
+  fi
 
   for pos in "${positions[@]}"; do
     local data
@@ -649,25 +702,27 @@ trap cleanup_script_mounts EXIT
 
 # ---------- Free-space wipe ----------
 list_partitions_with_fs() {
-  PART_NAMES=(); PART_SIZES=(); PART_FSTYPES=(); PART_MOUNTS=(); PART_PARENTS=(); PART_TYPES=()
+  PART_NAMES=(); PART_SIZES=(); PART_FSTYPES=(); PART_MOUNTS=(); PART_TOPS=(); PART_TYPES=(); PART_PATHS=()
 
-  local line NAME TYPE FSTYPE MOUNTPOINT SIZE PKNAME TRAN ROTA RM
+  local line NAME TYPE FSTYPE MOUNTPOINT SIZE TRAN ROTA RM DEVPATH
   while IFS= read -r line; do
     NAME="$(kv "$line" NAME)"
     TYPE="$(kv "$line" TYPE)"
     FSTYPE="$(kv "$line" FSTYPE)"
     MOUNTPOINT="$(kv "$line" MOUNTPOINT)"
     SIZE="$(kv "$line" SIZE)"
-    PKNAME="$(kv "$line" PKNAME)"
     TRAN="$(kv "$line" TRAN)"
     ROTA="$(kv "$line" ROTA)"
     RM="$(kv "$line" RM)"
+    DEVPATH="$(kv "$line" PATH)"
 
     [[ "${TYPE:-}" =~ ^(part|crypt)$ ]] || continue
     [[ -n "${FSTYPE:-}" ]] || continue
+    # PATH covers dm/crypt devices (/dev/mapper/...); fall back for old lsblk
+    [[ -n "${DEVPATH:-}" ]] || DEVPATH="/dev/$NAME"
 
     local cat top parent_info
-    top="$(top_level_disk "$NAME")"
+    top="$(top_level_disk "$DEVPATH")"
     parent_info="$(lsblk -dn -P -o TRAN,ROTA,RM "/dev/$top" 2>/dev/null || true)"
     if [[ -n "$parent_info" ]]; then
       TRAN="$(kv "$parent_info" TRAN)"
@@ -680,9 +735,10 @@ list_partitions_with_fs() {
     PART_SIZES+=("$SIZE")
     PART_FSTYPES+=("${FSTYPE:-"-"}")
     PART_MOUNTS+=("${MOUNTPOINT:-""}")
-    PART_PARENTS+=("${PKNAME:-"-"}")
+    PART_TOPS+=("${top:-"-"}")
     PART_TYPES+=("$cat")
-  done < <(lsblk -P -o NAME,TYPE,FSTYPE,MOUNTPOINT,SIZE,PKNAME,TRAN,ROTA,RM)
+    PART_PATHS+=("$DEVPATH")
+  done < <(lsblk -P -o NAME,TYPE,FSTYPE,MOUNTPOINT,SIZE,TRAN,ROTA,RM,PATH)
 }
 
 select_partition_for_wipe() {
@@ -705,7 +761,7 @@ select_partition_for_wipe() {
       status="${YEL}unmounted${RST}"
       mp="-"
     fi
-    is_system_partition "${PART_MOUNTS[$i]}" "${PART_PARENTS[$i]}" && marker=" ${RED}[SYSTEM]${RST}"
+    is_system_partition "${PART_MOUNTS[$i]}" "${PART_TOPS[$i]}" && marker=" ${RED}[SYSTEM]${RST}"
     uiprintf "  ${BOLD}[%d]${RST} %-12s %6s  %-7s %-10s %-26b %-20s%b\n" \
       "$((i+1))" \
       "${PART_NAMES[$i]}" \
@@ -731,18 +787,34 @@ select_partition_for_wipe() {
 }
 
 build_freespace_methods_for_partition() {
-  local name="$1" fstype="$2" mountpoint="$3" parent="$4" devtype="${5:-Unknown}"
+  local name="$1" fstype="$2" mountpoint="$3" top="$4" devtype="${5:-Unknown}" dev="${6:-}"
   METHOD_ID=(); METHOD_LABEL=(); METHOD_REC=(); METHOD_CMDS=(); METHOD_NOTES=(); METHOD_SECURITY=()
 
-  local dev
-  dev="$(devpath "$name")"
+  # dev is the real device path (covers /dev/mapper/... for crypt devices)
+  [[ -n "$dev" ]] || dev="$(devpath "$name")"
+
+  # Apple filesystems: no reliable free-space wipe from Linux.
+  # APFS rw access needs experimental drivers (apfs-fuse is read-only) and uses
+  # copy-on-write + snapshots; journaled HFS+ only mounts rw via risky -o force.
+  # Offer no method here — point the user to the native macOS tool instead.
+  case "${fstype:-}" in
+    apfs|hfs|hfsplus|hfsx)
+      ui ""
+      ui "${YEL}Free-space wipe for '${fstype}' is not reliably supported on Linux.${RST}"
+      ui "${DIM}APFS/HFS+ rw access on Linux is read-only or experimental and may corrupt the volume.${RST}"
+      ui "${DIM}Wipe free space natively on macOS instead:${RST}"
+      ui "${DIM}  diskutil secureErase freespace 0 /dev/diskNsM   (rotating HFS+; level 0 = single zero pass)${RST}"
+      ui "${DIM}Or, if ALL files may be destroyed, use mode [2] Secure Erase (block-level, filesystem-agnostic).${RST}"
+      return 0
+      ;;
+  esac
 
   if [[ -n "$mountpoint" ]]; then
     local is_flash=false
     if has_cmd fstrim; then
       if [[ "$devtype" =~ ^(NVMe|SSD)$ ]]; then
         is_flash=true
-      elif [[ -n "$parent" && "$parent" != "-" ]] && supports_discard "$parent"; then
+      elif [[ -n "$top" && "$top" != "-" ]] && supports_discard "$top"; then
         is_flash=true
       fi
     fi
@@ -865,8 +937,8 @@ build_freespace_methods_for_partition() {
             "unlock_bitlocker" \
             "Unlock BitLocker & mount (dislocker)" \
             "yes" \
-            "sudo mkdir -p ${dlpath} ${mntpoint}\nsudo dislocker $dev -- ${dlpath}\nsudo mount -o loop ${dlpath}/dislocker-file ${mntpoint}" \
-            "Prompts for BitLocker password, mounts under ${mntpoint}. Device appears in list after rescan." \
+            "sudo mkdir -p ${dlpath} ${mntpoint}\nsudo dislocker -u $dev -- ${dlpath}\nsudo mount -o loop ${dlpath}/dislocker-file ${mntpoint}" \
+            "Prompts for the BitLocker user password (-u). For a recovery key run manually with -p<KEY> instead. Mounts under ${mntpoint}; appears in list after rescan." \
             "-|-|Mount only – wipe free space in the next step"
         else
           add_method \
@@ -905,37 +977,39 @@ run_freespace_wipe() {
   local name="${PART_NAMES[$idx]}"
   local fstype="${PART_FSTYPES[$idx]}"
   local mountpoint="${PART_MOUNTS[$idx]}"
-  local parent="${PART_PARENTS[$idx]}"
+  local top="${PART_TOPS[$idx]}"
   local devtype="${PART_TYPES[$idx]}"
+  local path="${PART_PATHS[$idx]}"
 
-  if is_system_partition "$mountpoint" "$parent"; then
+  if is_system_partition "$mountpoint" "$top"; then
     ui ""
-    ui "${RED}${BOLD}WARNING: $(devpath "$name") is a SYSTEM PARTITION (mounted: ${mountpoint:-unmounted})${RST}"
+    ui "${RED}${BOLD}WARNING: ${path} is a SYSTEM PARTITION (mounted: ${mountpoint:-unmounted})${RST}"
     ui "${RED}Wiping free space on system partitions can cause data loss or an unbootable system.${RST}"
     ui ""
     read -r -p "Type 'YES' to continue anyway: " typed >&2
     [[ "$typed" == "YES" ]] || { ui "${CYA}Aborted.${RST}"; return 1; }
   fi
 
-  build_freespace_methods_for_partition "$name" "$fstype" "$mountpoint" "$parent" "$devtype"
+  build_freespace_methods_for_partition "$name" "$fstype" "$mountpoint" "$top" "$devtype" "$path"
 
   if ((${#METHOD_ID[@]} == 0)); then
     ui ""
     ui "${YEL}No free-space wipe methods available for this partition.${RST}"
-    [[ -z "$mountpoint" ]] && ui "${DIM}Hint: mount the partition first, or use zerofree for ext2/3/4.${RST}"
+    if [[ -z "$mountpoint" ]] && [[ ! "${fstype:-}" =~ ^(apfs|hfs|hfsplus|hfsx)$ ]]; then
+      ui "${DIM}Hint: mount the partition first, or use zerofree for ext2/3/4.${RST}"
+    fi
     return 0
   fi
 
   local method_choice
-  method_choice="$(select_method "$name")" || return 1
+  method_choice="$(select_method "$path")" || return 1
   [[ "$method_choice" == "QUIT" ]] && exit 0
   [[ "$method_choice" == "BACK" ]] && return 11
 
   local i=$((method_choice-1))
 
   if [[ "${METHOD_ID[$i]}" == "ntfswipe" ]]; then
-    local dev_path
-    dev_path="$(devpath "$name")"
+    local dev_path="$path"
     local -a opt_flag=("-u" "-i" "-t" "-l" "-d" "-p")
     local -a opt_label=(
       "unused clusters (free space)"
@@ -990,9 +1064,15 @@ run_freespace_wipe() {
   ui ""
   ui "${BOLD}Command(s):${RST}"
   ui "------------------------------------------------------------"
-  uiprintf "$(printf "%b\n" "${METHOD_CMDS[$i]}")\n"
+  printf '%b\n' "${METHOD_CMDS[$i]}" >&2
   ui "------------------------------------------------------------"
   ui ""
+
+  # Placeholder methods (missing tool) contain only comment lines
+  if ! has_real_command_lines "${METHOD_CMDS[$i]}"; then
+    ui "${YEL}Required tool is not installed — install it first (see above), then rescan.${RST}"
+    return 0
+  fi
 
   read -r -p "EXECUTE now? [y/N]: " ans >&2
   if [[ ! "$ans" =~ ^[Yy]$ ]]; then
@@ -1003,6 +1083,8 @@ run_freespace_wipe() {
   ui ""
   ui "${YEL}Executing...${RST}"
   ui ""
+
+  audit_log "START freespace dev=${path} fs=${fstype} method=${METHOD_ID[$i]} (${METHOD_LABEL[$i]})"
 
   local cmd_block="${METHOD_CMDS[$i]}"
   while IFS= read -r line; do
@@ -1026,12 +1108,14 @@ run_freespace_wipe() {
       post_cancel_cleanup "${METHOD_ID[$i]}" "$mountpoint"
       ui ""
       ui "${RED}Command failed or cancelled (exit code ${rc}). Aborting.${RST}"
+      audit_log "FAIL freespace dev=${path} method=${METHOD_ID[$i]} rc=${rc}"
       return 2
     fi
   done < <(printf '%b\n' "$cmd_block")
 
   ui ""
   ui "${GRN}Done.${RST}"
+  audit_log "DONE freespace dev=${path} method=${METHOD_ID[$i]}"
 
   # Unlock methods: track opened volumes and signal rescan
   local mid="${METHOD_ID[$i]}"
@@ -1220,9 +1304,9 @@ confirm_safe_state() {
 }
 
 select_method() {
-  local dev="$1"
+  local dev_display="$1"   # full device path, for display only
   ui ""
-  ui "${BOLD}Available erase methods for $(devpath "$dev"):${RST}"
+  ui "${BOLD}Available erase methods for ${dev_display}:${RST}"
   ui ""
 
   local rec_index=-1
@@ -1302,9 +1386,15 @@ run_or_print() {
   ui ""
   ui "${BOLD}Command(s):${RST}"
   ui "------------------------------------------------------------"
-  uiprintf "$(printf "%b\n" "${METHOD_CMDS[$i]}")\n"
+  printf '%b\n' "${METHOD_CMDS[$i]}" >&2
   ui "------------------------------------------------------------"
   ui ""
+
+  # Placeholder methods (missing tool) contain only comment lines
+  if ! has_real_command_lines "${METHOD_CMDS[$i]}"; then
+    ui "${YEL}Required tool is not installed — install it first (see above), then choose the method again.${RST}"
+    return 1
+  fi
 
   read -r -p "EXECUTE now? [y/N]: " ans >&2
   if [[ ! "$ans" =~ ^[Yy]$ ]]; then
@@ -1318,15 +1408,16 @@ run_or_print() {
 
   local cmd_block="${METHOD_CMDS[$i]}"
 
-  if ! has_real_command_lines "$cmd_block"; then
-    die "No executable commands (missing tools?)."
-  fi
-
   ui ""
   ui "${YEL}Executing...${RST}"
   ui ""
 
   local mid="${METHOD_ID[$i]}"
+  local model serial
+  model="$(lsblk -dno MODEL "$(devpath "$dev")" 2>/dev/null || true)"
+  serial="$(lsblk -dno SERIAL "$(devpath "$dev")" 2>/dev/null || true)"
+  audit_log "START erase dev=$(devpath "$dev") model='${model:-?}' serial='${serial:-?}' method=${mid} (${METHOD_LABEL[$i]})"
+
   local err_log
   err_log="$(mktemp)"
 
@@ -1342,6 +1433,12 @@ run_or_print() {
     trap 'ui ""; ui "${YEL}Cancel requested — sending SIGTERM (SIGKILL in 3s)...${RST}"; kill_tree '"$child_pid"' TERM; ( sleep 3; kill_tree '"$child_pid"' KILL ) >/dev/null 2>&1 &' INT
     wait "$child_pid"
     rc=$?
+    # wait returns 128+sig when interrupted by our trap; keep waiting until
+    # the child is actually gone so cleanup doesn't race with a dying tool.
+    while kill -0 "$child_pid" 2>/dev/null; do
+      wait "$child_pid" 2>/dev/null
+      rc=$?
+    done
     trap - INT
 
     if (( rc != 0 )); then
@@ -1352,8 +1449,21 @@ run_or_print() {
         continue
       fi
       rm -f "$err_log"
+      # ATA SE: set-pass succeeded but the erase step failed — remove the
+      # temporary password again, otherwise the drive stays security-locked.
+      if [[ "$mid" == "ata_secure_erase" && "$line" == *security-erase* ]]; then
+        ui ""
+        ui "${YEL}Erase failed after the ATA password was set — removing temporary password 'p'...${RST}"
+        if sudo hdparm --user-master u --security-disable p "$(devpath "$dev")" >/dev/null 2>&1; then
+          ui "${GRN}Temporary ATA password removed.${RST}"
+        else
+          ui "${RED}Could not remove the ATA password. Do it manually:${RST}"
+          ui "  sudo hdparm --user-master u --security-disable p $(devpath "$dev")"
+        fi
+      fi
       ui ""
       ui "${RED}Command failed (exit code ${rc}). Aborting.${RST}"
+      audit_log "FAIL erase dev=$(devpath "$dev") method=${mid} rc=${rc}"
       return 2
     fi
   done < <(printf '%b\n' "$cmd_block")
@@ -1362,9 +1472,11 @@ run_or_print() {
 
   ui ""
   ui "${GRN}Done.${RST}"
+  audit_log "DONE erase dev=$(devpath "$dev") method=${mid}"
 
   # Offer verification for methods where it makes sense
-  if [[ "$mid" == "dd_zero" || "$mid" == "shred" || "$mid" == "blkdiscard" ]]; then
+  # (badblocks -w included: its last pass writes zeros)
+  if [[ "$mid" == "dd_zero" || "$mid" == "shred" || "$mid" == "blkdiscard" || "$mid" == "badblocks_wipe" ]]; then
     verify_erase "$dev"
   else
     ui "${DIM}(Verification not meaningful for controller-level erase.)${RST}"
@@ -1437,7 +1549,7 @@ list_devices_flow() {
         status="${YEL}unmounted${RST}"
         mp="-"
       fi
-      is_system_partition "${PART_MOUNTS[$i]}" "${PART_PARENTS[$i]}" && marker=" ${RED}[SYSTEM]${RST}"
+      is_system_partition "${PART_MOUNTS[$i]}" "${PART_TOPS[$i]}" && marker=" ${RED}[SYSTEM]${RST}"
       uiprintf "  %-12s %6s  %-7s %-10s %-26b %-20s%b\n" \
         "${PART_NAMES[$i]}" \
         "${PART_SIZES[$i]}" \
@@ -1482,7 +1594,7 @@ secure_erase_flow() {
     local go_back=false
     while true; do
       local method_choice
-      method_choice="$(select_method "$dev")" || return 0
+      method_choice="$(select_method "$(devpath "$dev")")" || return 0
       [[ "$method_choice" == "QUIT" ]] && exit 0
 
       if [[ "$method_choice" == "BACK" ]]; then
