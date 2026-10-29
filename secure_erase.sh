@@ -135,6 +135,14 @@ top_level_disk() {
   printf '%s\n' "${cur##*/}"
 }
 
+# ALL top-level disks a device sits on, one per line. top_level_disk follows
+# only the first parent, so on RAID1 / LVM over several PVs only one member
+# disk would be found. lsblk -s walks the dependency tree upwards
+# (vg0-root -> md0p1 -> md0 -> sda2+sdb2 -> sda+sdb) and covers every member.
+top_level_disks() {
+  lsblk -s -nr -o NAME,TYPE "$1" 2>/dev/null | awk '$2=="disk"{print $1}' | sort -u
+}
+
 device_has_mounts() {
   local dev="$1"
   lsblk -nr -o MOUNTPOINT "$(devpath "$dev")" 2>/dev/null | awk 'NF{exit 0} END{exit 1}'
@@ -166,6 +174,55 @@ unmount_device_tree() {
   done
 }
 
+# Kernel users of a disk that have no mountpoint: dm (LVM, LUKS, multipath),
+# md RAID members and active ZFS vdevs. The mount check misses them, and
+# blkdiscard -f / dd / shred would happily overwrite an active LVM PV or RAID
+# member (blkdiscard -f also disables its own O_EXCL in-use check).
+# Prints one line per user; empty output = not in use.
+list_device_holders() {
+  local dev="$1" node h name p
+  local -a nodes=("/sys/block/$dev")
+  for p in "/sys/block/$dev/$dev"*; do
+    [[ -e "$p/partition" ]] && nodes+=("$p")
+  done
+
+  for node in "${nodes[@]}"; do
+    for h in "$node"/holders/*; do
+      [[ -e "$h" ]] || continue
+      name="${h##*/}"
+      [[ -r "/sys/block/$name/dm/name" ]] && name="$name ($(<"/sys/block/$name/dm/name"))"
+      printf '%s -> %s\n' "${node##*/}" "$name"
+    done
+  done
+
+  # ZFS opens its vdevs exclusively but registers no sysfs holders
+  if has_cmd zpool; then
+    local zp
+    zp="$(sudo zpool status -LP 2>/dev/null || true)"
+    for node in "${nodes[@]}"; do
+      grep -qE "/dev/${node##*/}([[:space:]]|$)" <<<"$zp" && printf '%s -> ZFS pool member\n' "${node##*/}"
+    done
+  fi
+  return 0
+}
+
+confirm_not_in_use() {
+  local dev="$1" holders line
+  holders="$(list_device_holders "$dev")"
+  [[ -z "$holders" ]] && return 0
+
+  ui ""
+  ui "${RED}${BOLD}$(devpath "$dev") is still in use by the kernel (no mountpoint involved):${RST}"
+  while IFS= read -r line; do ui "  $line"; done <<<"$holders"
+  ui ""
+  ui "${DIM}Release it first, e.g.:${RST}"
+  ui "${DIM}  LVM:   sudo vgchange -an <vg>${RST}"
+  ui "${DIM}  LUKS:  sudo cryptsetup close <name>${RST}"
+  ui "${DIM}  RAID:  sudo mdadm --stop /dev/mdX${RST}"
+  ui "${DIM}  ZFS:   sudo zpool export <pool>${RST}"
+  die "Aborted: device in use."
+}
+
 # ---------- Device categorization ----------
 # Returns: NVMe, SSD, HDD, eMMC, USB, Unknown
 categorize_device() {
@@ -187,17 +244,17 @@ categorize_device() {
 }
 
 # ---------- System disk detection ----------
-# Returns the top-level disk name (e.g. "sda") for a mountpoint.
-# Walks the full dm/LVM/LUKS stack: /dev/mapper/luks-root -> nvme0n1p2 ->
-# nvme0n1 — a single-PKNAME lookup would stop at the partition and the
-# system disk would never be flagged [SYSTEM] on encrypted-root systems.
+# Returns ALL top-level disks (e.g. "sda", one per line) for a mountpoint.
+# Walks the full dm/LVM/LUKS/md stack: /dev/mapper/luks-root -> nvme0n1p2 ->
+# nvme0n1 — a single-PKNAME lookup would stop at the partition, and on RAID1
+# or LVM over several PVs only the first member disk would be flagged [SYSTEM].
 get_base_device_for_mount() {
   local mp="$1"
   local src
   src="$(findmnt -n -o SOURCE "$mp" 2>/dev/null | head -n1)" || return 1
   src="${src%%\[*}"                 # btrfs subvolume suffix: /dev/sda2[/@root]
   [[ "$src" == /dev/* ]] || return 1  # skip overlay, tmpfs, autofs, ...
-  top_level_disk "$src"
+  top_level_disks "$src"
 }
 
 SYSTEM_DEVICES=()
@@ -247,16 +304,18 @@ detect_system_devices() {
   while IFS= read -r mp; do
     [[ -z "$mp" ]] && continue
     [[ "$mp" =~ ^(/|/boot|/usr|/var|/etc|/lib|/lib64|/bin|/sbin)(/|$) ]] || continue
-    dev="$(get_base_device_for_mount "$mp" 2>/dev/null)" || true
-    add_system_device "${dev:-}"
+    while IFS= read -r dev; do
+      add_system_device "$dev"
+    done < <(get_base_device_for_mount "$mp" 2>/dev/null || true)
   done < <(findmnt -rn -o TARGET 2>/dev/null)
 
   # Active swap devices count as system devices too.
   if [[ -r /proc/swaps ]]; then
     while IFS=' 	' read -r sw _rest; do
       [[ "$sw" == /dev/* ]] || continue
-      dev="$(top_level_disk "$sw")" || true
-      add_system_device "${dev:-}"
+      while IFS= read -r dev; do
+        add_system_device "$dev"
+      done < <(top_level_disks "$sw")
     done < <(tail -n +2 /proc/swaps 2>/dev/null)
   fi
 }
@@ -467,19 +526,38 @@ build_methods_for_device() {
       ;;
 
     USB|eMMC)
-      # USB/eMMC: blkdiscard if supported, then dd, then shred
+      # eMMC: Secure Discard (BLKSECDISCARD) makes the controller physically
+      #       erase the blocks incl. stale copies; plain discard is only a hint.
+      #       Many eMMC >= 4.51 reject it (secure erase/trim deprecated in favour
+      #       of sanitize) -> "Operation not supported", then use dd.
+      # USB:  the bridge usually hides native erase commands and TRIM is only a
+      #       hint, so overwrite first; discard is offered as a follow-up step.
       if supports_discard "$dev" && has_cmd blkdiscard; then
+        if [[ "$category" == "eMMC" ]]; then
+          add_method \
+            "blkdiscard_secure" \
+            "Secure Discard (blkdiscard -s, whole device)" \
+            "yes" \
+            "sudo blkdiscard -f -s $(devpath "$dev")" \
+            "Controller physically erases all blocks incl. stale copies. Rejected by many newer eMMC ('Operation not supported') – then choose dd." \
+            "★★★|practically impossible|Secure discard forces physical erasure of the blocks and their old copies"
+        fi
+
         add_method \
           "blkdiscard" \
           "Discard/TRIM (whole device)" \
-          "yes" \
+          "no" \
           "sudo blkdiscard -f $(devpath "$dev")" \
-          "Fast, if supported by the controller." \
+          "Fast, but only marks blocks as free. Best used AFTER an overwrite (dd), not instead of it." \
           "★★☆|possible with special equipment|TRIM marks blocks as free, physical erasure depends on controller"
       fi
 
-      local rec_dd="no"
-      [[ "${#METHOD_ID[@]}" -eq 0 ]] && rec_dd="yes"
+      # dd is recommended unless an earlier method (eMMC secure discard) already is.
+      # Count first: "${arr[@]}" on an empty array trips nounset in bash < 4.4.
+      local rec_dd="yes" r
+      if ((${#METHOD_REC[@]} > 0)); then
+        for r in "${METHOD_REC[@]}"; do [[ "$r" == "yes" ]] && rec_dd="no"; done
+      fi
       add_method \
         "dd_zero" \
         "Overwrite with zeros, dd" \
@@ -621,9 +699,15 @@ print_security_rating() {
 
 # ---------- Post-erase verification ----------
 verify_erase() {
-  local dev="$1"
+  local dev="$1" mid="${2:-}"
 
   ui ""
+  # After TRIM many SSDs return zeros for discarded LBAs (DZAT/RZAT) straight
+  # from the mapping table — the flash cells may still hold the old data.
+  if [[ "$mid" == "blkdiscard" ]]; then
+    ui "${YEL}Note:${RST} ${DIM}After TRIM many drives read discarded blocks as zeros although the"
+    ui "      flash cells are not physically erased yet. Zeros here do NOT prove erasure.${RST}"
+  fi
   read -r -p "Run verification (checks if blocks are empty)? [y/N]: " ans >&2
   [[ "$ans" =~ ^[Yy]$ ]] || return 0
 
@@ -671,7 +755,9 @@ verify_erase() {
   done
 
   ui ""
-  if [[ "$all_zero" == "true" ]]; then
+  if [[ "$all_zero" == "true" && "$mid" == "blkdiscard" ]]; then
+    ui "${YEL}All checked blocks read as zeros — logical view only, physical erasure NOT verified.${RST}"
+  elif [[ "$all_zero" == "true" ]]; then
     ui "${GRN}All checked blocks are empty (zeros).${RST}"
   else
     ui "${YEL}Non-zero data found. Possible causes:${RST}"
@@ -1477,7 +1563,7 @@ run_or_print() {
   # Offer verification for methods where it makes sense
   # (badblocks -w included: its last pass writes zeros)
   if [[ "$mid" == "dd_zero" || "$mid" == "shred" || "$mid" == "blkdiscard" || "$mid" == "badblocks_wipe" ]]; then
-    verify_erase "$dev"
+    verify_erase "$dev" "$mid"
   else
     ui "${DIM}(Verification not meaningful for controller-level erase.)${RST}"
   fi
@@ -1589,6 +1675,7 @@ secure_erase_flow() {
     show_device_summary "$dev" "$category"
     confirm_system_disk "$dev"
     confirm_safe_state "$dev"
+    confirm_not_in_use "$dev"
     build_methods_for_device "$dev" "$category"
 
     local go_back=false
